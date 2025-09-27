@@ -24,3 +24,6 @@ class Currency(CurrencyBase):
     
     class Config:
         from_attributes = True
+
+
+

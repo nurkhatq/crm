@@ -46,7 +46,7 @@ class ProductUpdate(BaseModel):
 class Product(ProductBase):
     """Product response schema"""
     id: int
-    external_id: str
+    external_id: Optional[str] = None
     external_updated: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime

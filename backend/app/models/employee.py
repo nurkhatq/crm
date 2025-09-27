@@ -17,3 +17,6 @@ class Employee(Base, TimestampMixin):
     
     def __repr__(self) -> str:
         return f"<Employee(id={self.id}, name='{self.name}')>"
+
+
+

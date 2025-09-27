@@ -11,7 +11,8 @@ from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker, Session
 from app.core.config import settings
 from app.models.sync_log import SyncLog
-from app.models.product import Product, ProductStock
+from app.models.product import Product
+from app.models import StockReport as ProductStock
 from app.models.customer import Customer
 from app.models.document import Document
 

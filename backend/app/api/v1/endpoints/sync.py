@@ -1,282 +1,344 @@
 """
-Synchronization endpoints
+Обновленные endpoints для синхронизации с улучшенной обработкой ошибок
 """
+import logging
+from typing import Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, desc
+from pydantic import BaseModel
 
 from app.core.database import get_db
-from app.schemas.sync import SyncRequest, SyncResponse, SyncLog
 from app.services.sync import SyncService
-from app.tasks.sync_tasks import (
-    sync_products_task, sync_customers_task, sync_documents_task, sync_stock_task, sync_stores_task, full_sync_task,
-    enhanced_sync_products_task, enhanced_sync_services_task, enhanced_sync_bundles_task,
-    enhanced_sync_stores_task, enhanced_sync_currencies_task, enhanced_full_sync_task,
-    enhanced_sync_turnover_task, enhanced_sync_retail_documents_task, enhanced_sync_employee_context_task
-)
+from app.models import SyncLog
+from app.connectors.moysklad import moysklad_connector
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
+class SyncRequest(BaseModel):
+    sync_type: str = "full"  # full, products, customers, documents, stock, stores
+    force: bool = False
+
+
+class SyncResponse(BaseModel):
+    status: str
+    message: str
+    sync_id: Optional[int] = None
+    details: Optional[Dict[str, Any]] = None
+
+
+class SyncStatusResponse(BaseModel):
+    id: int
+    sync_type: str
+    entity_type: str
+    status: str
+    started_at: str
+    completed_at: Optional[str]
+    records_processed: int
+    records_created: int
+    records_updated: int
+    records_errors: int
+    error_details: Optional[str]
+
+
 @router.post("/sync", response_model=SyncResponse)
-async def trigger_sync(
-    request: SyncRequest,
+async def start_sync(
+    sync_request: SyncRequest,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
-    """Trigger synchronization with MoySklad"""
+    """
+    Запустить синхронизацию данных из МойСклад
     
-    sync_service = SyncService(db)
+    Типы синхронизации:
+    - full: Полная синхронизация всех данных
+    - products: Только товары
+    - customers: Только контрагенты
+    - stores: Только склады
+    - stock: Только остатки товаров
+    """
+    
+    # Проверяем, включен ли коннектор
+    if not moysklad_connector.is_enabled():
+        logger.warning("🚫 Попытка синхронизации при отключенном коннекторе")
+        raise HTTPException(
+            status_code=400,
+            detail="MoySklad connector is not enabled. Please check your token configuration."
+        )
+    
+    # Проверяем соединение
+    try:
+        connection_ok = await moysklad_connector.test_connection()
+        if not connection_ok:
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to connect to MoySklad API. Please check your token and network connection."
+            )
+    except Exception as e:
+        logger.error(f"❌ Ошибка тестирования соединения: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Connection test failed: {str(e)}"
+        )
+    
+    # Валидация типа синхронизации
+    valid_sync_types = ["full", "products", "customers", "stores", "stock"]
+    if sync_request.sync_type not in valid_sync_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid sync_type. Must be one of: {', '.join(valid_sync_types)}"
+        )
     
     try:
-        if request.sync_type == "full":
-            # Trigger full sync in background
-            task = full_sync_task.delay(force=request.force)
-            return SyncResponse(
-                message="Full synchronization started",
-                sync_id=None,
-                status="started"
-            )
+        sync_service = SyncService(db)
         
-        elif request.sync_type == "products":
-            task = sync_products_task.delay(force=request.force)
-            return SyncResponse(
-                message="Products synchronization started",
-                sync_id=None,
-                status="started"
-            )
+        logger.info(f"🚀 Запуск синхронизации: {sync_request.sync_type} (force: {sync_request.force})")
         
-        elif request.sync_type == "customers":
-            task = sync_customers_task.delay(force=request.force)
-            return SyncResponse(
-                message="Customers synchronization started",
-                sync_id=None,
-                status="started"
+        # Выбираем метод синхронизации
+        if sync_request.sync_type == "full":
+            background_tasks.add_task(
+                run_full_sync, 
+                sync_service, 
+                sync_request.force
             )
+            message = "Full synchronization started in background"
+            
+        elif sync_request.sync_type == "products":
+            background_tasks.add_task(
+                run_products_sync, 
+                sync_service, 
+                sync_request.force
+            )
+            message = "Products synchronization started in background"
+            
+        elif sync_request.sync_type == "customers":
+            background_tasks.add_task(
+                run_customers_sync, 
+                sync_service, 
+                sync_request.force
+            )
+            message = "Customers synchronization started in background"
+            
+        elif sync_request.sync_type == "stores":
+            background_tasks.add_task(
+                run_stores_sync, 
+                sync_service
+            )
+            message = "Stores synchronization started in background"
+            
+        elif sync_request.sync_type == "stock":
+            background_tasks.add_task(
+                run_stock_sync, 
+                sync_service
+            )
+            message = "Stock synchronization started in background"
         
-        elif request.sync_type == "documents":
-            task = sync_documents_task.delay(force=request.force)
-            return SyncResponse(
-                message="Documents synchronization started",
-                sync_id=None,
-                status="started"
-            )
+        logger.info(f"✅ Синхронизация {sync_request.sync_type} запущена в фоне")
         
-        elif request.sync_type == "stock":
-            task = sync_stock_task.delay(force=request.force)
-            return SyncResponse(
-                message="Stock synchronization started",
-                sync_id=None,
-                status="started"
-            )
+        return SyncResponse(
+            status="started",
+            message=message
+        )
         
-        elif request.sync_type == "stores":
-            task = sync_stores_task.delay(force=request.force)
-            return SyncResponse(
-                message="Stores synchronization started",
-                sync_id=None,
-                status="started"
-            )
-        
-        else:
-            raise HTTPException(
-                status_code=400, 
-                detail="Invalid sync type. Must be one of: full, products, customers, documents, stock, stores"
-            )
-    
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start synchronization: {str(e)}")
+        logger.error(f"❌ Ошибка запуска синхронизации: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start synchronization: {str(e)}"
+        )
 
 
-@router.get("/status", response_model=list[SyncLog])
+# Background task функции
+async def run_full_sync(sync_service: SyncService, force: bool):
+    """Запуск полной синхронизации в фоне"""
+    try:
+        result = await sync_service.full_sync(force)
+        logger.info(f"✅ Полная синхронизация завершена: {result}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка полной синхронизации: {e}")
+
+
+async def run_products_sync(sync_service: SyncService, force: bool):
+    """Запуск синхронизации товаров в фоне"""
+    try:
+        result = await sync_service.sync_products(force)
+        logger.info(f"✅ Синхронизация товаров завершена: {result}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка синхронизации товаров: {e}")
+
+
+async def run_customers_sync(sync_service: SyncService, force: bool):
+    """Запуск синхронизации контрагентов в фоне"""
+    try:
+        result = await sync_service.sync_customers(force)
+        logger.info(f"✅ Синхронизация контрагентов завершена: {result}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка синхронизации контрагентов: {e}")
+
+
+async def run_stores_sync(sync_service: SyncService):
+    """Запуск синхронизации складов в фоне"""
+    try:
+        result = await sync_service.sync_stores()
+        logger.info(f"✅ Синхронизация складов завершена: {result}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка синхронизации складов: {e}")
+
+
+async def run_stock_sync(sync_service: SyncService):
+    """Запуск синхронизации остатков в фоне"""
+    try:
+        # Получаем отчет об остатках
+        stock_data = await moysklad_connector.get_stock_report()
+        logger.info(f"✅ Получен отчет об остатках: {len(stock_data)} записей")
+        
+        # TODO: Сохранить остатки в БД
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка синхронизации остатков: {e}")
+
+
+@router.get("/status", response_model=list[SyncStatusResponse])
 async def get_sync_status(
     limit: int = 10,
     db: AsyncSession = Depends(get_db)
 ):
-    """Get recent synchronization status"""
-    
-    from sqlalchemy import select, desc
-    from app.models import SyncLog as SyncLogModel
-    
-    query = select(SyncLogModel).order_by(desc(SyncLogModel.started_at)).limit(limit)
-    result = await db.execute(query)
-    sync_logs = result.scalars().all()
-    
-    return sync_logs
+    """Получить статус последних синхронизаций"""
+    try:
+        query = select(SyncLog).order_by(desc(SyncLog.started_at)).limit(limit)
+        result = await db.execute(query)
+        sync_logs = result.scalars().all()
+        
+        response_logs = []
+        for log in sync_logs:
+            response_logs.append(SyncStatusResponse(
+                id=log.id,
+                sync_type=log.sync_type,
+                entity_type=log.entity_type,
+                status=log.status,
+                started_at=log.started_at.isoformat(),
+                completed_at=log.completed_at.isoformat() if log.completed_at else None,
+                records_processed=log.records_processed,
+                records_created=log.records_created,
+                records_updated=log.records_updated,
+                records_errors=log.records_errors,
+                error_details=log.error_details
+            ))
+        
+        return response_logs
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения статуса синхронизации: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get sync status: {str(e)}"
+        )
 
 
 @router.get("/test-connection")
 async def test_moysklad_connection():
-    """Test connection to MoySklad API"""
-    from app.connectors.moysklad import MoySkladConnector
-    
-    connector = MoySkladConnector()
-    
-    if not connector.is_enabled():
-        return {"status": "error", "message": "MoySklad connector is not enabled"}
-    
+    """Тестировать соединение с API МойСклад"""
     try:
-        # Test basic connection
-        success = await connector.test_connection()
-        
-        if success:
+        if not moysklad_connector.is_enabled():
             return {
-                "status": "success", 
-                "message": "Connection to MoySklad API successful",
+                "status": "disabled",
+                "message": "MoySklad connector is not enabled. Please configure MOYSKLAD_TOKEN in .env file.",
+                "token_configured": False
+            }
+        
+        # Тестируем соединение
+        connection_ok = await moysklad_connector.test_connection()
+        
+        if connection_ok:
+            return {
+                "status": "success",
+                "message": "✅ Connection to MoySklad API successful",
                 "token_configured": True
             }
         else:
             return {
-                "status": "error", 
-                "message": "Failed to connect to MoySklad API",
+                "status": "error",
+                "message": "❌ Failed to connect to MoySklad API. Please check your token.",
                 "token_configured": True
             }
             
     except Exception as e:
+        logger.error(f"❌ Ошибка тестирования соединения: {e}")
         return {
-            "status": "error", 
-            "message": f"Connection test failed: {str(e)}",
-            "token_configured": connector.is_enabled()
+            "status": "error",
+            "message": f"❌ Connection test failed: {str(e)}",
+            "token_configured": moysklad_connector.is_enabled()
         }
 
 
-@router.post("/sync/enhanced", response_model=SyncResponse)
-async def trigger_enhanced_sync(
-    request: SyncRequest,
-    background_tasks: BackgroundTasks,
-    db: AsyncSession = Depends(get_db)
-):
-    """Trigger enhanced synchronization with MoySklad (полное извлечение данных)"""
-    
+@router.get("/api-status")
+async def get_api_status():
+    """Получить расширенную информацию о статусе API"""
     try:
-        if request.sync_type == "full":
-            # Запускаем полную улучшенную синхронизацию
-            task = enhanced_full_sync_task.delay(force=request.force)
-            return SyncResponse(
-                message="Enhanced full synchronization started (все доступные данные)",
-                sync_id=None,
-                status="started"
-            )
+        if not moysklad_connector.is_enabled():
+            return {
+                "connector_enabled": False,
+                "token_configured": False,
+                "api_accessible": False,
+                "message": "Connector is disabled - no token configured"
+            }
         
-        elif request.sync_type == "products":
-            task = enhanced_sync_products_task.delay(force=request.force)
-            return SyncResponse(
-                message="Enhanced products synchronization started (с расширенными данными)",
-                sync_id=None,
-                status="started"
-            )
+        # Тестируем различные endpoints
+        endpoints_status = {}
         
-        elif request.sync_type == "services":
-            task = enhanced_sync_services_task.delay(force=request.force)
-            return SyncResponse(
-                message="Services synchronization started",
-                sync_id=None,
-                status="started"
+        # Тестируем товары
+        try:
+            products_data, status_code = await moysklad_connector._make_request(
+                'GET', 'entity/product', params={'limit': 1}
             )
+            endpoints_status['products'] = {
+                'accessible': status_code == 200,
+                'count': products_data.get('meta', {}).get('size', 0) if status_code == 200 else 0
+            }
+        except Exception as e:
+            endpoints_status['products'] = {'accessible': False, 'error': str(e)}
         
-        elif request.sync_type == "bundles":
-            task = enhanced_sync_bundles_task.delay(force=request.force)
-            return SyncResponse(
-                message="Bundles synchronization started",
-                sync_id=None,
-                status="started"
+        # Тестируем контрагентов
+        try:
+            customers_data, status_code = await moysklad_connector._make_request(
+                'GET', 'entity/counterparty', params={'limit': 1}
             )
+            endpoints_status['customers'] = {
+                'accessible': status_code == 200,
+                'count': customers_data.get('meta', {}).get('size', 0) if status_code == 200 else 0
+            }
+        except Exception as e:
+            endpoints_status['customers'] = {'accessible': False, 'error': str(e)}
         
-        elif request.sync_type == "stores":
-            task = enhanced_sync_stores_task.delay(force=request.force)
-            return SyncResponse(
-                message="Enhanced stores synchronization started",
-                sync_id=None,
-                status="started"
+        # Тестируем склады
+        try:
+            stores_data, status_code = await moysklad_connector._make_request(
+                'GET', 'entity/store', params={'limit': 1}
             )
+            endpoints_status['stores'] = {
+                'accessible': status_code == 200,
+                'count': stores_data.get('meta', {}).get('size', 0) if status_code == 200 else 0
+            }
+        except Exception as e:
+            endpoints_status['stores'] = {'accessible': False, 'error': str(e)}
         
-        elif request.sync_type == "currencies":
-            task = enhanced_sync_currencies_task.delay(force=request.force)
-            return SyncResponse(
-                message="Currencies synchronization started",
-                sync_id=None,
-                status="started"
-            )
-        
-        elif request.sync_type == "turnover":
-            task = enhanced_sync_turnover_task.delay(force=request.force)
-            return SyncResponse(
-                message="Turnover reports synchronization started",
-                sync_id=None,
-                status="started"
-            )
-        
-        elif request.sync_type == "retail_documents":
-            task = enhanced_sync_retail_documents_task.delay(force=request.force)
-            return SyncResponse(
-                message="Retail documents synchronization started",
-                sync_id=None,
-                status="started"
-            )
-        
-        elif request.sync_type == "employee_context":
-            task = enhanced_sync_employee_context_task.delay(force=request.force)
-            return SyncResponse(
-                message="Employee context synchronization started",
-                sync_id=None,
-                status="started"
-            )
-        
-        else:
-            raise HTTPException(
-                status_code=400, 
-                detail="Invalid enhanced sync type. Must be one of: full, products, services, bundles, stores, currencies, turnover, retail_documents, employee_context"
-            )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start enhanced synchronization: {str(e)}")
-
-
-@router.get("/api-analysis")
-async def get_api_analysis():
-    """Получить анализ доступных API endpoints МойСклад"""
-    try:
-        # Возвращаем результаты анализа API
-        analysis_results = {
-            "available_endpoints": {
-                "products": {"count": 103, "description": "Товары"},
-                "assortment": {"count": 152, "description": "Весь ассортимент (товары + услуги + комплекты)"},
-                "services": {"count": 1, "description": "Услуги"},
-                "bundles": {"count": 48, "description": "Комплекты"},
-                "stock_all": {"count": 46, "description": "Остатки всех товаров"},
-                "stock_bystore": {"count": 46, "description": "Остатки по складам"},
-                "counterparties": {"count": 6, "description": "Контрагенты"},
-                "organizations": {"count": 1, "description": "Организации"},
-                "demands": {"count": 51, "description": "Отгрузки"},
-                "salesreturns": {"count": 28, "description": "Возвраты покупателей"},
-                "supplies": {"count": 40, "description": "Приемки"},
-                "stores": {"count": 6, "description": "Склады"},
-                "moves": {"count": 2, "description": "Перемещения"},
-                "currencies": {"count": 1, "description": "Валюты"},
-                "uom": {"count": 62, "description": "Единицы измерения"},
-                "productfolders": {"count": 15, "description": "Группы товаров"},
-                "contracts": {"count": 1, "description": "Договоры"},
-                "countries": {"count": 252, "description": "Страны"},
-                "profit_byproduct": {"count": 34, "description": "Прибыльность по товарам"},
-                "employee_context": {"count": 1, "description": "Контекст сотрудника"},
-                "turnover_reports": {"count": "unknown", "description": "Отчеты по оборотам товаров"},
-                "retail_documents": {"count": "unknown", "description": "Розничные документы"}
-            },
-            "unavailable_endpoints": [
-                "customerorders", "invoiceouts", "purchaseorders", "invoiceins", 
-                "purchasereturns", "enters", "losses", "inventories", "projects"
-            ],
-            "api_errors": [
-                "retailsale", "pricetype", "money_cash", "stock_all_current"
-            ],
-            "recommendations": [
-                "Использовать enhanced sync для получения максимального объема данных",
-                "Синхронизировать все доступные типы товаров (products, services, bundles)",
-                "Получать остатки из нескольких endpoints для полноты данных",
-                "Синхронизировать справочники (stores, currencies, uom, countries)"
-            ]
+        return {
+            "connector_enabled": True,
+            "token_configured": True,
+            "api_accessible": any(ep.get('accessible', False) for ep in endpoints_status.values()),
+            "endpoints": endpoints_status,
+            "message": "API status check completed"
         }
         
-        return analysis_results
-        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get API analysis: {str(e)}")
+        logger.error(f"❌ Ошибка получения статуса API: {e}")
+        return {
+            "connector_enabled": moysklad_connector.is_enabled(),
+            "token_configured": moysklad_connector.is_enabled(),
+            "api_accessible": False,
+            "error": str(e),
+            "message": "Failed to check API status"
+        }

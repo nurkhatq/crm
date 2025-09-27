@@ -135,3 +135,6 @@ def enhanced_full_sync_task(self, force: bool = False):
     except Exception as e:
         logger.error(f"Error in enhanced full sync task: {e}")
         return {"error": str(e), "status": "error"}
+
+
+

@@ -38,3 +38,6 @@ async def get_stores(
         return stores_list
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching stores: {str(e)}")
+
+
+

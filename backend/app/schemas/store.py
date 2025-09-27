@@ -22,3 +22,6 @@ class Store(StoreBase):
     
     class Config:
         from_attributes = True
+
+
+

@@ -11,7 +11,7 @@ class CustomerBase(BaseModel):
     name: str = Field(..., description="Customer name")
     code: Optional[str] = Field(None, description="Customer code")
     legal_title: Optional[str] = Field(None, description="Legal title")
-    email: Optional[EmailStr] = Field(None, description="Email address")
+    email: Optional[str] = Field(None, description="Email address")
     phone: Optional[str] = Field(None, description="Phone number")
     inn: Optional[str] = Field(None, description="INN")
     kpp: Optional[str] = Field(None, description="KPP")
@@ -31,7 +31,7 @@ class CustomerUpdate(BaseModel):
     name: Optional[str] = None
     code: Optional[str] = None
     legal_title: Optional[str] = None
-    email: Optional[EmailStr] = None
+    email: Optional[str] = None
     phone: Optional[str] = None
     inn: Optional[str] = None
     kpp: Optional[str] = None
@@ -43,7 +43,7 @@ class CustomerUpdate(BaseModel):
 class Customer(CustomerBase):
     """Customer response schema"""
     id: int
-    external_id: str
+    external_id: Optional[str] = None
     external_updated: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime

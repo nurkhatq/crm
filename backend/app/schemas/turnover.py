@@ -7,13 +7,15 @@ from pydantic import BaseModel
 
 class ProductTurnoverBase(BaseModel):
     """Base product turnover schema"""
-    product_external_id: str
-    product_name: str
-    product_code: str = None
-    stock_at_period_start: float = 0
-    income: float = 0
-    outcome: float = 0
-    stock_at_period_end: float = 0
+    moysklad_product_id: str
+    period_start: datetime = None
+    period_end: datetime = None
+    stock_start: float = 0
+    stock_end: float = 0
+    income_quantity: float = 0
+    outcome_quantity: float = 0
+    income_sum: float = 0
+    outcome_sum: float = 0
 
 
 class ProductTurnover(ProductTurnoverBase):
@@ -24,3 +26,6 @@ class ProductTurnover(ProductTurnoverBase):
     
     class Config:
         from_attributes = True
+
+
+

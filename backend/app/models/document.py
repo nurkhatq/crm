@@ -32,7 +32,7 @@ class Document(Base, TimestampMixin, ExternalDataMixin):
     store_name = Column(String(200), nullable=True, comment="Store name")
     
     # Relationships
-    customer = relationship("Customer", back_populates="documents")
+    customer = relationship("Customer", back_populates="documents", lazy="select")
     
     def __repr__(self) -> str:
         return f"<Document(id={self.id}, type='{self.document_type}', name='{self.name}')>"

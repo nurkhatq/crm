@@ -112,3 +112,6 @@ def test_stock_data_structure():
 if __name__ == "__main__":
     test_stock_endpoints()
     test_stock_data_structure()
+
+
+

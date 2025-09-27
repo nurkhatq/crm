@@ -1,45 +1,44 @@
 """
-Synchronization service for MoySklad data
+Улучшенный сервис синхронизации с МойСклад
 """
-import asyncio
-import json
 import logging
 from datetime import datetime, timezone
-from decimal import Decimal
-from typing import Any, Dict, List, Optional
-
-from sqlalchemy import select, update
+from typing import Dict, List, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy import select, update, delete
+from sqlalchemy.dialects.postgresql import insert
 
 from app.connectors.moysklad import moysklad_connector
-from app.models import Product, ProductStock, Customer, Document, SyncLog
-from app.schemas.sync import SyncLog as SyncLogSchema
+from app.models import Product, Customer, Document, SyncLog, Store
+from app.core.database import get_db
 
 logger = logging.getLogger(__name__)
 
 
 class SyncService:
-    """Service for synchronizing data from MoySklad"""
+    """Улучшенный сервис синхронизации данных из МойСклад"""
     
     def __init__(self, db: AsyncSession):
         self.db = db
+        self.connector = moysklad_connector
     
-    async def create_sync_log(
-        self, 
-        sync_type: str, 
-        entity_type: Optional[str] = None
-    ) -> SyncLog:
-        """Create sync log entry"""
+    async def create_sync_log(self, sync_type: str, entity_type: str) -> SyncLog:
+        """Создать лог синхронизации"""
         sync_log = SyncLog(
             sync_type=sync_type,
             entity_type=entity_type,
             status="in_progress",
-            started_at=datetime.now(timezone.utc)
+            started_at=datetime.now(timezone.utc),
+            records_processed=0,
+            records_created=0,
+            records_updated=0,
+            records_errors=0
         )
+        
         self.db.add(sync_log)
         await self.db.commit()
         await self.db.refresh(sync_log)
+        
         return sync_log
     
     async def update_sync_log(
@@ -50,509 +49,470 @@ class SyncService:
         records_created: int = 0,
         records_updated: int = 0,
         records_errors: int = 0,
-        error_message: Optional[str] = None,
         error_details: Optional[str] = None
-    ) -> None:
-        """Update sync log entry"""
+    ):
+        """Обновить лог синхронизации"""
         sync_log.status = status
+        sync_log.completed_at = datetime.now(timezone.utc)
         sync_log.records_processed = records_processed
         sync_log.records_created = records_created
         sync_log.records_updated = records_updated
         sync_log.records_errors = records_errors
-        sync_log.error_message = error_message
-        sync_log.error_details = error_details
         
-        if status in ["success", "error"]:
-            sync_log.completed_at = datetime.now(timezone.utc)
+        if error_details:
+            sync_log.error_details = error_details
         
         await self.db.commit()
     
+    def _safe_get_value(self, data: Dict, path: str, default: Any = None) -> Any:
+        """Безопасное извлечение значения из вложенного словаря"""
+        try:
+            keys = path.split('.')
+            current = data
+            
+            for key in keys:
+                if isinstance(current, dict) and key in current:
+                    current = current[key]
+                else:
+                    return default
+            
+            return current if current is not None else default
+        except Exception:
+            return default
+    
+    def _parse_datetime(self, date_str: str) -> Optional[datetime]:
+        """Парсинг даты из строки МойСклад"""
+        if not date_str:
+            return None
+        
+        try:
+            # МойСклад возвращает даты в формате ISO 8601
+            if date_str.endswith('Z'):
+                date_str = date_str[:-1] + '+00:00'
+            elif '+' not in date_str and not date_str.endswith('+00:00'):
+                date_str = date_str + '+00:00'
+            
+            return datetime.fromisoformat(date_str)
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось парсить дату '{date_str}': {e}")
+            return None
+    
+    def _extract_price(self, price_data: Any, default: float = 0.0) -> float:
+        """Извлечение цены из данных МойСклад"""
+        if isinstance(price_data, dict):
+            value = price_data.get('value', 0)
+        elif isinstance(price_data, (int, float)):
+            value = price_data
+        elif isinstance(price_data, list) and price_data:
+            # Берем первую цену из массива
+            first_price = price_data[0]
+            if isinstance(first_price, dict):
+                value = first_price.get('value', default)
+            else:
+                value = default
+        else:
+            value = default
+        
+        try:
+            # МойСклад хранит цены в копейках
+            return float(value) / 100.0 if value else default
+        except (ValueError, TypeError):
+            return default
+    
     async def sync_products(self, force: bool = False) -> Dict[str, Any]:
-        """Synchronize products from MoySklad"""
-        if not moysklad_connector.is_enabled():
+        """Синхронизация товаров"""
+        if not self.connector.is_enabled():
             return {"error": "MoySklad connector is not enabled"}
         
         sync_log = await self.create_sync_log("products", "product")
         
         try:
-            # Initialize counters
-            records_processed = 0
-            records_created = 0
-            records_updated = 0
-            records_errors = 0
+            logger.info("🔄 Начинаем синхронизацию товаров...")
             
-            # Get last sync time for incremental sync
-            last_sync = None
-            if not force:
-                last_sync_log = await self.db.execute(
-                    select(SyncLog)
-                    .where(SyncLog.sync_type == "products")
-                    .where(SyncLog.status == "success")
-                    .order_by(SyncLog.completed_at.desc())
-                    .limit(1)  # Only get the most recent one
-                )
-                last_sync_result = last_sync_log.scalar_one_or_none()
-                if last_sync_result:
-                    last_sync = last_sync_result.completed_at
+            # Получаем все товары из МойСклад
+            moysklad_products = await self.connector.get_all_products()
             
-            # Fetch products from MoySklad
-            products_data = await moysklad_connector.get_all_products(updated_since=last_sync)
+            if not moysklad_products:
+                logger.warning("⚠️ Не получено товаров из МойСклад")
+                await self.update_sync_log(sync_log, "completed", 0, 0, 0, 0)
+                return {
+                    "status": "completed",
+                    "message": "No products found in MoySklad",
+                    "records_processed": 0,
+                    "records_created": 0,
+                    "records_updated": 0,
+                    "records_errors": 0
+                }
             
-            for product_data in products_data:
+            created_count = 0
+            updated_count = 0
+            error_count = 0
+            processed_count = 0
+            
+            for product_data in moysklad_products:
                 try:
-                    records_processed += 1
+                    processed_count += 1
+                    product_id = product_data.get('id')
                     
-                    # Check if product exists
-                    existing_product = await self.db.execute(
-                        select(Product).where(Product.external_id == product_data["id"])
-                    )
-                    existing_product = existing_product.scalar_one_or_none()
-                    
-                    # Prepare product data
-                    product_dict = {
-                        "external_id": product_data["id"],
-                        "name": product_data.get("name", ""),
-                        "code": product_data.get("code"),
-                        "article": product_data.get("article"),
-                        "description": product_data.get("description"),
-                        "archived": product_data.get("archived", False),
-                        "external_raw": json.dumps(product_data, ensure_ascii=False),
-                        "external_updated": datetime.fromisoformat(
-                            product_data.get("updated", "").replace("Z", "+00:00")
-                        ) if product_data.get("updated") else None
-                    }
-                    
-                    # Extract pricing information
-                    if "salePrices" in product_data and product_data["salePrices"]:
-                        product_dict["sale_price"] = Decimal(str(product_data["salePrices"][0].get("value", 0)))
-                    
-                    if "buyPrice" in product_data and product_data["buyPrice"]:
-                        product_dict["buy_price"] = Decimal(str(product_data["buyPrice"].get("value", 0)))
-                    
-                    # Extract additional information
-                    if "uom" in product_data and product_data["uom"]:
-                        product_dict["uom"] = product_data["uom"].get("name")
-                    
-                    if "productFolder" in product_data and product_data["productFolder"]:
-                        product_dict["group_name"] = product_data["productFolder"].get("name")
-                    
-                    if "supplier" in product_data and product_data["supplier"]:
-                        product_dict["supplier_name"] = product_data["supplier"].get("name")
-                    
-                    if existing_product:
-                        # Update existing product
-                        for key, value in product_dict.items():
-                            setattr(existing_product, key, value)
-                        records_updated += 1
-                    else:
-                        # Create new product
-                        new_product = Product(**product_dict)
-                        self.db.add(new_product)
-                        records_created += 1
-                    
-                except Exception as e:
-                    logger.error(f"Error processing product {product_data.get('id', 'unknown')}: {e}")
-                    records_errors += 1
-            
-            await self.db.commit()
-            await self.update_sync_log(
-                sync_log, 
-                "success", 
-                records_processed, 
-                records_created, 
-                records_updated, 
-                records_errors
-            )
-            
-            return {
-                "status": "success",
-                "sync_id": sync_log.id,
-                "records_processed": records_processed,
-                "records_created": records_created,
-                "records_updated": records_updated,
-                "records_errors": records_errors
-            }
-            
-        except Exception as e:
-            logger.error(f"Error syncing products: {e}")
-            await self.update_sync_log(
-                sync_log, 
-                "error", 
-                records_processed, 
-                records_created, 
-                records_updated, 
-                records_errors,
-                str(e)
-            )
-            return {"error": str(e), "sync_id": sync_log.id}
-    
-    async def sync_customers(self, force: bool = False) -> Dict[str, Any]:
-        """Synchronize customers from MoySklad"""
-        if not moysklad_connector.is_enabled():
-            return {"error": "MoySklad connector is not enabled"}
-        
-        sync_log = await self.create_sync_log("customers", "counterparty")
-        
-        try:
-            # Initialize counters
-            records_processed = 0
-            records_created = 0
-            records_updated = 0
-            records_errors = 0
-            
-            # Get last sync time for incremental sync
-            last_sync = None
-            if not force:
-                last_sync_log = await self.db.execute(
-                    select(SyncLog)
-                    .where(SyncLog.sync_type == "customers")
-                    .where(SyncLog.status == "success")
-                    .order_by(SyncLog.completed_at.desc())
-                    .limit(1)  # Only get the most recent one
-                )
-                last_sync_result = last_sync_log.scalar_one_or_none()
-                if last_sync_result:
-                    last_sync = last_sync_result.completed_at
-            
-            # Fetch customers from MoySklad
-            customers_data = await moysklad_connector.get_all_customers(updated_since=last_sync)
-            
-            for customer_data in customers_data:
-                try:
-                    records_processed += 1
-                    
-                    # Check if customer exists
-                    existing_customer = await self.db.execute(
-                        select(Customer).where(Customer.external_id == customer_data["id"])
-                    )
-                    existing_customer = existing_customer.scalar_one_or_none()
-                    
-                    # Prepare customer data
-                    customer_dict = {
-                        "external_id": customer_data["id"],
-                        "name": customer_data.get("name", ""),
-                        "code": customer_data.get("code"),
-                        "legal_title": customer_data.get("legalTitle"),
-                        "email": customer_data.get("email"),
-                        "phone": customer_data.get("phone"),
-                        "inn": customer_data.get("inn"),
-                        "kpp": customer_data.get("kpp"),
-                        "archived": customer_data.get("archived", False),
-                        "external_raw": json.dumps(customer_data, ensure_ascii=False),
-                        "external_updated": datetime.fromisoformat(
-                            customer_data.get("updated", "").replace("Z", "+00:00")
-                        ) if customer_data.get("updated") else None
-                    }
-                    
-                    # Extract address information
-                    if "actualAddress" in customer_data and customer_data["actualAddress"]:
-                        address_parts = []
-                        for field in ["addInfo", "apartment", "city", "comment", "country", "house", "postalCode", "region", "street"]:
-                            if customer_data["actualAddress"].get(field):
-                                address_parts.append(customer_data["actualAddress"][field])
-                        customer_dict["address"] = ", ".join(address_parts)
-                    
-                    if existing_customer:
-                        # Update existing customer
-                        for key, value in customer_dict.items():
-                            setattr(existing_customer, key, value)
-                        records_updated += 1
-                    else:
-                        # Create new customer
-                        new_customer = Customer(**customer_dict)
-                        self.db.add(new_customer)
-                        records_created += 1
-                    
-                except Exception as e:
-                    logger.error(f"Error processing customer {customer_data.get('id', 'unknown')}: {e}")
-                    records_errors += 1
-            
-            await self.db.commit()
-            await self.update_sync_log(
-                sync_log, 
-                "success", 
-                records_processed, 
-                records_created, 
-                records_updated, 
-                records_errors
-            )
-            
-            return {
-                "status": "success",
-                "sync_id": sync_log.id,
-                "records_processed": records_processed,
-                "records_created": records_created,
-                "records_updated": records_updated,
-                "records_errors": records_errors
-            }
-            
-        except Exception as e:
-            logger.error(f"Error syncing customers: {e}")
-            await self.update_sync_log(
-                sync_log, 
-                "error", 
-                records_processed, 
-                records_created, 
-                records_updated, 
-                records_errors,
-                str(e)
-            )
-            return {"error": str(e), "sync_id": sync_log.id}
-    
-    async def sync_documents(self, force: bool = False) -> Dict[str, Any]:
-        """Synchronize documents from MoySklad"""
-        if not moysklad_connector.is_enabled():
-            return {"error": "MoySklad connector is not enabled"}
-        
-        sync_log = await self.create_sync_log("documents", "document")
-        
-        try:
-            # Initialize counters
-            records_processed = 0
-            records_created = 0
-            records_updated = 0
-            records_errors = 0
-            
-            # Document types to sync
-            document_types = ["customerorder", "demand", "invoiceout", "salesreturn", "retailsale"]
-            
-            # Get last sync time for incremental sync
-            last_sync = None
-            if not force:
-                last_sync_log = await self.db.execute(
-                    select(SyncLog)
-                    .where(SyncLog.sync_type == "documents")
-                    .where(SyncLog.status == "success")
-                    .order_by(SyncLog.completed_at.desc())
-                    .limit(1)  # Only get the most recent one
-                )
-                last_sync_result = last_sync_log.scalar_one_or_none()
-                if last_sync_result:
-                    last_sync = last_sync_result.completed_at
-            
-            # Fetch documents from MoySklad
-            documents_data = await moysklad_connector.get_all_documents(
-                document_types, 
-                updated_since=last_sync
-            )
-            
-            for document_data in documents_data:
-                try:
-                    records_processed += 1
-                    
-                    # Check if document exists
-                    existing_document = await self.db.execute(
-                        select(Document).where(Document.external_id == document_data["id"])
-                    )
-                    existing_document = existing_document.scalar_one_or_none()
-                    
-                    # Prepare document data
-                    document_dict = {
-                        "external_id": document_data["id"],
-                        "name": document_data.get("name", ""),
-                        "document_type": document_data.get("_document_type", ""),
-                        "applicable": document_data.get("applicable", False),
-                        "external_raw": json.dumps(document_data, ensure_ascii=False),
-                        "external_updated": datetime.fromisoformat(
-                            document_data.get("updated", "").replace("Z", "+00:00")
-                        ) if document_data.get("updated") else None
-                    }
-                    
-                    # Extract moment
-                    if "moment" in document_data and document_data["moment"]:
-                        document_dict["moment"] = datetime.fromisoformat(
-                            document_data["moment"].replace("Z", "+00:00")
-                        )
-                    
-                    # Extract sum
-                    if "sum" in document_data and document_data["sum"]:
-                        document_dict["sum"] = Decimal(str(document_data["sum"]))
-                    
-                    # Extract currency
-                    if "rate" in document_data and document_data["rate"]:
-                        document_dict["currency"] = document_data["rate"].get("currency", {}).get("name", "RUB")
-                    
-                    # Extract state
-                    if "state" in document_data and document_data["state"]:
-                        document_dict["state_name"] = document_data["state"].get("name")
-                    
-                    # Extract organization
-                    if "organization" in document_data and document_data["organization"]:
-                        document_dict["organization_name"] = document_data["organization"].get("name")
-                    
-                    # Extract store
-                    if "store" in document_data and document_data["store"]:
-                        document_dict["store_name"] = document_data["store"].get("name")
-                    
-                    # Extract customer
-                    customer_id = None
-                    if "agent" in document_data and document_data["agent"]:
-                        customer_external_id = document_data["agent"]["id"]
-                        customer = await self.db.execute(
-                            select(Customer).where(Customer.external_id == customer_external_id)
-                        )
-                        customer = customer.scalar_one_or_none()
-                        if customer:
-                            customer_id = customer.id
-                    
-                    document_dict["customer_id"] = customer_id
-                    
-                    if existing_document:
-                        # Update existing document
-                        for key, value in document_dict.items():
-                            setattr(existing_document, key, value)
-                        records_updated += 1
-                    else:
-                        # Create new document
-                        new_document = Document(**document_dict)
-                        self.db.add(new_document)
-                        records_created += 1
-                    
-                except Exception as e:
-                    logger.error(f"Error processing document {document_data.get('id', 'unknown')}: {e}")
-                    records_errors += 1
-            
-            await self.db.commit()
-            await self.update_sync_log(
-                sync_log, 
-                "success", 
-                records_processed, 
-                records_created, 
-                records_updated, 
-                records_errors
-            )
-            
-            return {
-                "status": "success",
-                "sync_id": sync_log.id,
-                "records_processed": records_processed,
-                "records_created": records_created,
-                "records_updated": records_updated,
-                "records_errors": records_errors
-            }
-            
-        except Exception as e:
-            logger.error(f"Error syncing documents: {e}")
-            await self.update_sync_log(
-                sync_log, 
-                "error", 
-                records_processed, 
-                records_created, 
-                records_updated, 
-                records_errors,
-                str(e)
-            )
-            return {"error": str(e), "sync_id": sync_log.id}
-    
-    async def sync_stock(self, force: bool = False) -> Dict[str, Any]:
-        """Synchronize stock data from MoySklad"""
-        if not moysklad_connector.is_enabled():
-            return {"error": "MoySklad connector is not enabled"}
-        
-        sync_log = await self.create_sync_log("stock", "stock")
-        
-        try:
-            # Fetch stock data from MoySklad
-            stock_data = await moysklad_connector.get_stock_report()
-            
-            records_processed = 0
-            records_created = 0
-            records_updated = 0
-            records_errors = 0
-            
-            for stock_item in stock_data:
-                try:
-                    records_processed += 1
-                    
-                    # Find product by external ID
-                    product_external_id = stock_item["meta"]["href"].split("/")[-1]
-                    product = await self.db.execute(
-                        select(Product).where(Product.external_id == product_external_id)
-                    )
-                    product = product.scalar_one_or_none()
-                    
-                    if not product:
-                        records_errors += 1
+                    if not product_id:
+                        logger.warning(f"⚠️ Товар без ID пропущен: {product_data.get('name', 'Unknown')}")
+                        error_count += 1
                         continue
                     
-                    # Check if stock record exists
-                    existing_stock = await self.db.execute(
-                        select(ProductStock).where(ProductStock.product_id == product.id)
-                    )
-                    existing_stock = existing_stock.scalar_one_or_none()
+                    # Проверяем, существует ли товар
+                    query = select(Product).where(Product.moysklad_id == product_id)
+                    result = await self.db.execute(query)
+                    existing_product = result.scalar_one_or_none()
                     
-                    # Prepare stock data
-                    stock_dict = {
-                        "product_id": product.id,
-                        "stock": Decimal(str(stock_item.get("stock", 0))),
-                        "reserve": Decimal(str(stock_item.get("reserve", 0))),
-                        "in_transit": Decimal(str(stock_item.get("inTransit", 0))),
-                        "available": Decimal(str(stock_item.get("quantity", 0))),
-                        "store_name": stock_item.get("name"),
-                        "store_id": stock_item.get("id")
+                    # Подготавливаем данные товара
+                    product_dict = {
+                        'moysklad_id': product_id,
+                        'name': product_data.get('name', ''),
+                        'code': product_data.get('code', ''),
+                        'article': product_data.get('article', ''),
+                        'description': product_data.get('description', ''),
+                        'archived': product_data.get('archived', False),
+                        'entity_type': product_data.get('entity_type', 'product'),
+                        
+                        # Цены
+                        'sale_price': self._extract_price(
+                            self._safe_get_value(product_data, 'salePrices', [])
+                        ),
+                        'buy_price': self._extract_price(
+                            self._safe_get_value(product_data, 'buyPrice', {})
+                        ),
+                        
+                        # Связанные сущности
+                        'uom_name': self._safe_get_value(product_data, 'uom.name', ''),
+                        'group_name': self._safe_get_value(product_data, 'productFolder.name', ''),
+                        'supplier_name': self._safe_get_value(product_data, 'supplier.name', ''),
+                        
+                        # Метаданные
+                        'updated_at': self._parse_datetime(
+                            product_data.get('updated', '')
+                        ) or datetime.now(timezone.utc),
+                        'synced_at': datetime.now(timezone.utc)
                     }
                     
-                    if existing_stock:
-                        # Update existing stock
-                        for key, value in stock_dict.items():
-                            setattr(existing_stock, key, value)
-                        records_updated += 1
+                    if existing_product:
+                        # Обновляем существующий товар
+                        for key, value in product_dict.items():
+                            if hasattr(existing_product, key):
+                                setattr(existing_product, key, value)
+                        
+                        updated_count += 1
+                        if updated_count % 100 == 0:
+                            logger.info(f"📊 Обновлено товаров: {updated_count}")
                     else:
-                        # Create new stock record
-                        new_stock = ProductStock(**stock_dict)
-                        self.db.add(new_stock)
-                        records_created += 1
+                        # Создаем новый товар
+                        new_product = Product(**product_dict)
+                        self.db.add(new_product)
+                        created_count += 1
+                        
+                        if created_count % 100 == 0:
+                            logger.info(f"📊 Создано товаров: {created_count}")
                     
+                    # Коммитим каждые 500 записей
+                    if processed_count % 500 == 0:
+                        await self.db.commit()
+                        logger.info(f"💾 Промежуточный коммит: {processed_count} товаров обработано")
+                
                 except Exception as e:
-                    logger.error(f"Error processing stock item {stock_item.get('id', 'unknown')}: {e}")
-                    records_errors += 1
+                    logger.error(f"❌ Ошибка обработки товара {product_data.get('name', 'Unknown')}: {e}")
+                    error_count += 1
+                    continue
             
+            # Финальный коммит
             await self.db.commit()
+            
+            # Обновляем лог синхронизации
             await self.update_sync_log(
-                sync_log, 
-                "success", 
-                records_processed, 
-                records_created, 
-                records_updated, 
-                records_errors
+                sync_log,
+                "success",
+                processed_count,
+                created_count,
+                updated_count,
+                error_count
             )
+            
+            logger.info(f"✅ Синхронизация товаров завершена:")
+            logger.info(f"   📊 Обработано: {processed_count}")
+            logger.info(f"   ✨ Создано: {created_count}")
+            logger.info(f"   🔄 Обновлено: {updated_count}")
+            logger.info(f"   ❌ Ошибок: {error_count}")
             
             return {
                 "status": "success",
-                "sync_id": sync_log.id,
-                "records_processed": records_processed,
-                "records_created": records_created,
-                "records_updated": records_updated,
-                "records_errors": records_errors
+                "records_processed": processed_count,
+                "records_created": created_count,
+                "records_updated": updated_count,
+                "records_errors": error_count
             }
             
         except Exception as e:
-            logger.error(f"Error syncing stock: {e}")
+            logger.error(f"❌ Критическая ошибка синхронизации товаров: {e}")
+            await self.update_sync_log(sync_log, "failed", error_details=str(e))
+            return {
+                "status": "failed",
+                "error": str(e),
+                "records_processed": 0,
+                "records_created": 0,
+                "records_updated": 0,
+                "records_errors": 0
+            }
+    
+    async def sync_customers(self, force: bool = False) -> Dict[str, Any]:
+        """Синхронизация контрагентов"""
+        if not self.connector.is_enabled():
+            return {"error": "MoySklad connector is not enabled"}
+        
+        sync_log = await self.create_sync_log("customers", "customer")
+        
+        try:
+            logger.info("🔄 Начинаем синхронизацию контрагентов...")
+            
+            # Получаем всех контрагентов из МойСклад
+            moysklad_customers = await self.connector.get_all_customers()
+            
+            if not moysklad_customers:
+                logger.warning("⚠️ Не получено контрагентов из МойСклад")
+                await self.update_sync_log(sync_log, "completed", 0, 0, 0, 0)
+                return {
+                    "status": "completed", 
+                    "message": "No customers found in MoySklad",
+                    "records_processed": 0,
+                    "records_created": 0,
+                    "records_updated": 0,
+                    "records_errors": 0
+                }
+            
+            created_count = 0
+            updated_count = 0
+            error_count = 0
+            processed_count = 0
+            
+            for customer_data in moysklad_customers:
+                try:
+                    processed_count += 1
+                    customer_id = customer_data.get('id')
+                    
+                    if not customer_id:
+                        logger.warning(f"⚠️ Контрагент без ID пропущен: {customer_data.get('name', 'Unknown')}")
+                        error_count += 1
+                        continue
+                    
+                    # Проверяем, существует ли контрагент
+                    query = select(Customer).where(Customer.moysklad_id == customer_id)
+                    result = await self.db.execute(query)
+                    existing_customer = result.scalar_one_or_none()
+                    
+                    # Подготавливаем данные контрагента
+                    customer_dict = {
+                        'moysklad_id': customer_id,
+                        'name': customer_data.get('name', ''),
+                        'code': customer_data.get('code', ''),
+                        'legal_title': customer_data.get('legalTitle', ''),
+                        'email': customer_data.get('email', ''),
+                        'phone': customer_data.get('phone', ''),
+                        'inn': customer_data.get('inn', ''),
+                        'kpp': customer_data.get('kpp', ''),
+                        'archived': customer_data.get('archived', False),
+                        
+                        # Адреса
+                        'legal_address': self._safe_get_value(customer_data, 'legalAddress', ''),
+                        'actual_address': self._safe_get_value(customer_data, 'actualAddress', ''),
+                        
+                        # Связанные данные
+                        'group_name': self._safe_get_value(customer_data, 'group.name', ''),
+                        'discount_percentage': customer_data.get('discountPercentage', 0.0),
+                        
+                        # Метаданные
+                        'updated_at': self._parse_datetime(
+                            customer_data.get('updated', '')
+                        ) or datetime.now(timezone.utc),
+                        'synced_at': datetime.now(timezone.utc)
+                    }
+                    
+                    if existing_customer:
+                        # Обновляем существующего контрагента
+                        for key, value in customer_dict.items():
+                            if hasattr(existing_customer, key):
+                                setattr(existing_customer, key, value)
+                        
+                        updated_count += 1
+                        if updated_count % 100 == 0:
+                            logger.info(f"📊 Обновлено контрагентов: {updated_count}")
+                    else:
+                        # Создаем нового контрагента
+                        new_customer = Customer(**customer_dict)
+                        self.db.add(new_customer)
+                        created_count += 1
+                        
+                        if created_count % 100 == 0:
+                            logger.info(f"📊 Создано контрагентов: {created_count}")
+                    
+                    # Коммитим каждые 500 записей
+                    if processed_count % 500 == 0:
+                        await self.db.commit()
+                        logger.info(f"💾 Промежуточный коммит: {processed_count} контрагентов обработано")
+                
+                except Exception as e:
+                    logger.error(f"❌ Ошибка обработки контрагента {customer_data.get('name', 'Unknown')}: {e}")
+                    error_count += 1
+                    continue
+            
+            # Финальный коммит
+            await self.db.commit()
+            
+            # Обновляем лог синхронизации
             await self.update_sync_log(
-                sync_log, 
-                "error", 
-                records_processed, 
-                records_created, 
-                records_updated, 
-                records_errors,
-                str(e)
+                sync_log,
+                "success", 
+                processed_count,
+                created_count,
+                updated_count,
+                error_count
             )
-            return {"error": str(e), "sync_id": sync_log.id}
+            
+            logger.info(f"✅ Синхронизация контрагентов завершена:")
+            logger.info(f"   📊 Обработано: {processed_count}")
+            logger.info(f"   ✨ Создано: {created_count}")
+            logger.info(f"   🔄 Обновлено: {updated_count}")
+            logger.info(f"   ❌ Ошибок: {error_count}")
+            
+            return {
+                "status": "success",
+                "records_processed": processed_count,
+                "records_created": created_count,
+                "records_updated": updated_count,
+                "records_errors": error_count
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Критическая ошибка синхронизации контрагентов: {e}")
+            await self.update_sync_log(sync_log, "failed", error_details=str(e))
+            return {
+                "status": "failed",
+                "error": str(e),
+                "records_processed": 0,
+                "records_created": 0,
+                "records_updated": 0,
+                "records_errors": 0
+            }
+    
+    async def sync_stores(self) -> Dict[str, Any]:
+        """Синхронизация складов"""
+        if not self.connector.is_enabled():
+            return {"error": "MoySklad connector is not enabled"}
+        
+        sync_log = await self.create_sync_log("stores", "store")
+        
+        try:
+            logger.info("🔄 Начинаем синхронизацию складов...")
+            
+            moysklad_stores = await self.connector.get_all_stores()
+            
+            created_count = 0
+            updated_count = 0
+            error_count = 0
+            processed_count = 0
+            
+            for store_data in moysklad_stores:
+                try:
+                    processed_count += 1
+                    store_id = store_data.get('id')
+                    
+                    if not store_id:
+                        error_count += 1
+                        continue
+                    
+                    # Проверяем существование склада
+                    query = select(Store).where(Store.moysklad_id == store_id)
+                    result = await self.db.execute(query)
+                    existing_store = result.scalar_one_or_none()
+                    
+                    store_dict = {
+                        'moysklad_id': store_id,
+                        'name': store_data.get('name', ''),
+                        'code': store_data.get('code', ''),
+                        'address': store_data.get('address', ''),
+                        'archived': store_data.get('archived', False),
+                        'synced_at': datetime.now(timezone.utc)
+                    }
+                    
+                    if existing_store:
+                        for key, value in store_dict.items():
+                            if hasattr(existing_store, key):
+                                setattr(existing_store, key, value)
+                        updated_count += 1
+                    else:
+                        new_store = Store(**store_dict)
+                        self.db.add(new_store)
+                        created_count += 1
+                
+                except Exception as e:
+                    logger.error(f"❌ Ошибка обработки склада: {e}")
+                    error_count += 1
+                    continue
+            
+            await self.db.commit()
+            
+            await self.update_sync_log(
+                sync_log,
+                "success",
+                processed_count,
+                created_count, 
+                updated_count,
+                error_count
+            )
+            
+            logger.info(f"✅ Синхронизация складов завершена: создано {created_count}, обновлено {updated_count}")
+            
+            return {
+                "status": "success",
+                "records_processed": processed_count,
+                "records_created": created_count,
+                "records_updated": updated_count,
+                "records_errors": error_count
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка синхронизации складов: {e}")
+            await self.update_sync_log(sync_log, "failed", error_details=str(e))
+            return {"status": "failed", "error": str(e)}
     
     async def full_sync(self, force: bool = False) -> Dict[str, Any]:
-        """Perform full synchronization of all data"""
+        """Полная синхронизация всех данных"""
+        logger.info("🚀 Начинаем полную синхронизацию...")
+        
         results = {}
         
-        # Sync products
+        # Синхронизируем склады
+        results["stores"] = await self.sync_stores()
+        
+        # Синхронизируем товары
         results["products"] = await self.sync_products(force)
         
-        # Sync customers
+        # Синхронизируем контрагентов
         results["customers"] = await self.sync_customers(force)
         
-        # Sync documents
-        results["documents"] = await self.sync_documents(force)
+        # Подсчитываем общую статистику
+        total_processed = sum(r.get("records_processed", 0) for r in results.values() if isinstance(r, dict))
+        total_created = sum(r.get("records_created", 0) for r in results.values() if isinstance(r, dict))
+        total_updated = sum(r.get("records_updated", 0) for r in results.values() if isinstance(r, dict))
+        total_errors = sum(r.get("records_errors", 0) for r in results.values() if isinstance(r, dict))
         
-        # Sync stock
-        results["stock"] = await self.sync_stock(force)
+        logger.info("🎉 Полная синхронизация завершена:")
+        logger.info(f"   📊 Всего обработано: {total_processed}")
+        logger.info(f"   ✨ Всего создано: {total_created}")
+        logger.info(f"   🔄 Всего обновлено: {total_updated}")
+        logger.info(f"   ❌ Всего ошибок: {total_errors}")
         
-        return results
+        return {
+            "status": "success",
+            "total_processed": total_processed,
+            "total_created": total_created,
+            "total_updated": total_updated,
+            "total_errors": total_errors,
+            "details": results
+        }

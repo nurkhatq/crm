@@ -26,7 +26,7 @@ async def get_products(
     """Get products with optional filtering"""
     
     # Build query
-    query = select(Product).options(selectinload(Product.stock))
+    query = select(Product)
     
     # Apply filters
     if search:

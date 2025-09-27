@@ -24,3 +24,6 @@ async def get_employees(
         return employees
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching employees: {str(e)}")
+
+
+
